@@ -397,8 +397,23 @@ def format_result(r):
         # 参照
         r["AA_name"], r["AB_sector"]
     ]
-    # Noneを空文字に変換
-    return [x if x is not None else "" for x in row]
+    
+    # JSONエラー対策: None, Infinity, NaN を空文字に変換
+    cleaned_row = []
+    for x in row:
+        if x is None:
+            cleaned_row.append("")
+            continue
+        
+        if isinstance(x, float):
+            # inf, -inf, nan であれば空文字にする
+            if np.isinf(x) or np.isnan(x):
+                cleaned_row.append("")
+                continue
+        
+        cleaned_row.append(x)
+
+    return cleaned_row
 
 # ==========================================
 # 4. メイン処理
