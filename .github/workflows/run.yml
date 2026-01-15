@@ -1,4 +1,4 @@
-name: Yamamoto Model Screener
+name: mddm Screener
 
 on:
   schedule:
