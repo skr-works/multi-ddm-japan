@@ -371,10 +371,33 @@ def main():
 
     config = get_config_from_env()
     sheet = connect_gsheet(config)
+
+    # --- ヘッダー書き込み (1行目: B列〜AB列) ---
+    headers = [
+        "①営業費用売上比率", "①判定",
+        "②配当性向(%)", "②判定",
+        "③売上高CAGR(%)", "③判定",
+        "時価総額", "発行済株式数", "自己資本", "営業利益", "決算期",
+        "NOPAT係数", "擬似配当係数",
+        "NOPAT", "擬似配当", "擬似ROE(%)",
+        "ROE区分", "7年後配当倍率", "7年後配当",
+        "将来利回り(%)", "市場平均配当利回り",
+        "上値目途(倍率)", "直近終値", "目標株価",
+        "最終判定",
+        "会社名", "業種"
+    ]
+    sheet.update(range_name="B1:AB1", values=[headers])
     
-    # A列の銘柄コード読み込み
-    tickers = sheet.col_values(1)[1:] # 1行目はヘッダと仮定
-    tickers = [t for t in tickers if t] # 空文字除外
+    # --- A列の銘柄コード読み込み & .T付与 ---
+    raw_tickers = sheet.col_values(1)[1:] # 1行目はヘッダと仮定
+    tickers = []
+    for t in raw_tickers:
+        if t:
+            t_str = str(t).strip()
+            # .T を自動付与
+            if not t_str.endswith(".T"):
+                t_str += ".T"
+            tickers.append(t_str)
     
     print(f"Target Tickers: {len(tickers)}")
     
