@@ -45,7 +45,7 @@ def connect_gsheet(config):
     return worksheet
 
 # ==========================================
-# 2. スクレイピング & 通信ヘルパー (buhin.py統合版)
+# 2. スクレイピング & 通信ヘルパー
 # ==========================================
 
 def create_session():
@@ -53,7 +53,7 @@ def create_session():
     session = requests.Session()
     retry = Retry(
         total=3,
-        backoff_factor=1,
+        backoff_factor=2, # バックオフを少し長めに
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
     )
@@ -70,64 +70,43 @@ def is_market_open():
     return True, "稼働日"
 
 def get_yahoo_jp_info(ticker_code):
-    """
-    Yahoo!ファイナンス(日本)から以下を取得
-    1. 配当性向 (優先)
-    2. 銘柄名
-    3. 業種
-    """
+    """Yahoo!ファイナンス(日本)から情報を取得 (エラー時はNoneを返す)"""
     code_only = str(ticker_code).replace(".T", "")
-    
-    # 配当ページ
     url_div = f"https://finance.yahoo.co.jp/quote/{code_only}.T/dividend"
-    # プロフィールページ(業種・社名用)
     url_prof = f"https://finance.yahoo.co.jp/quote/{code_only}.T/profile"
     
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    data = {
-        "payout_ratio": None,
-        "name": str(ticker_code),
-        "sector": "-"
-    }
+    data = {"payout_ratio": None, "name": str(ticker_code), "sector": "-"}
 
     try:
-        # スクレイピング検知回避のためのランダム待機
-        time.sleep(random.uniform(1.0, 2.0))
+        # ランダム待機 (サーバー負荷軽減)
+        time.sleep(random.uniform(1.5, 3.0))
 
-        # --- 1. 配当性向の取得 ---
+        # 1. 配当性向
         try:
             res = _HTTP_SESSION.get(url_div, headers=headers, timeout=10)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, "html.parser")
-                # "配当性向" という文字列を含むthを探し、その隣のtdを取得
                 th = soup.find("th", string=re.compile("配当性向"))
                 if th:
                     td = th.find_next_sibling("td")
                     if td:
                         text = td.get_text(strip=True).replace("%", "")
-                        # ハイフン等は除外
-                        if text and text != "-" and text != "---":
+                        if text and text not in ["-", "---"]:
                             data["payout_ratio"] = float(text)
-        except Exception as e:
-            # ログ漏洩防止のため銘柄コードは出さない
-            print(f"Yahoo JP Dividend Error: {e}")
+        except:
+            pass # ログ抑制
         
-        # --- 2. 銘柄名・業種の取得 ---
+        # 2. 銘柄名・業種
         try:
             res_prof = _HTTP_SESSION.get(url_prof, headers=headers, timeout=10)
             if res_prof.status_code == 200:
                 soup = BeautifulSoup(res_prof.text, "html.parser")
-                
-                # 社名
                 title_tag = soup.find("title")
                 if title_tag:
-                    # <title>トヨタ自動車(株)【7203】...
                     m = re.search(r'(.*?)【', title_tag.text)
-                    if m:
-                        data["name"] = m.group(1).strip()
+                    if m: data["name"] = m.group(1).strip()
                 
-                # 業種 (YahooファイナンスのHTML構造から推測)
-                # 東証33業種リストにある単語が含まれているかチェック
                 TSE_SECTORS = [
                     "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
                     "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
@@ -141,44 +120,29 @@ def get_yahoo_jp_info(ticker_code):
                     if sec in text_content:
                         data["sector"] = sec
                         break
-        except Exception as e:
-            print(f"Yahoo JP Profile Error: {e}")
+        except:
+            pass # ログ抑制
 
-    except Exception as e:
-        print(f"Yahoo JP Scraping Critical Error: {e}")
+    except:
+        pass # ログ抑制
     
     return data
 
 # ==========================================
-# 3. コアロジック: 山本潤式モデル
+# 3. コアロジック
 # ==========================================
 
 def get_value(df, keys, date_col):
-    """
-    buhin.py から移植・改良
-    財務データDataFrameから特定の日付・キーの値を取得する
-    """
-    if df.empty or date_col is None:
+    if df.empty or date_col is None or date_col not in df.columns:
         return 0
-    
-    # date_colがDataFrameに存在するかチェック
-    if date_col not in df.columns:
-        return 0
-
     for key in keys:
         if key in df.index:
             val = df.loc[key, date_col]
-            if pd.isna(val):
-                continue
-            return float(val)
+            if not pd.isna(val):
+                return float(val)
     return 0
 
 def analyze_stock(ticker, current_price_cache):
-    """
-    1銘柄の分析を実行。
-    戻り値: スプレッドシートの1行分（B列～Z列+参照データ）のリスト
-    """
-    # 結果格納用辞書 (初期値: 不合格)
     res = {
         "B_cost_ratio": None, "C_judge1": "不合格",
         "D_payout": None, "E_judge2": "不合格",
@@ -190,52 +154,41 @@ def analyze_stock(ticker, current_price_cache):
         "U_fut_yield": None, "V_mkt_yield": CONST_MARKET_YIELD,
         "W_upside": None, "X_price": None, "Y_target": None,
         "Z_final": "不合格",
-        # 参照用
         "AA_name": "", "AB_sector": ""
     }
 
     try:
-        # --- データ取得 ---
-        # 1. Yahoo Japan (配当性向優先)
+        # Yahoo JP
         yj_data = get_yahoo_jp_info(ticker)
         res["AA_name"] = yj_data["name"]
         res["AB_sector"] = yj_data["sector"]
         
-        # 2. yfinance
+        # yfinance
         tk = yf.Ticker(ticker)
         info = tk.info or {}
-        
-        # 財務データ (Annual)
         fins = tk.financials
         bs = tk.balance_sheet
         
-        # データが空の場合は終了
         if fins.empty or bs.empty:
             return format_result(res)
 
-        # 現在株価 (キャッシュ または info)
+        # 現在株価
         current_price = current_price_cache.get(ticker)
         if not current_price:
             current_price = info.get("currentPrice") or info.get("previousClose")
         res["X_price"] = current_price
 
-        # 最新の決算日を取得 (列名が日付になっている)
         dates = fins.columns
-        if len(dates) == 0:
-            return format_result(res)
-        latest_date = dates[0] # 最新
+        if len(dates) == 0: return format_result(res)
+        latest_date = dates[0]
 
-        # ---------------------------
-        # フェーズ1: 3つのゲート
-        # ---------------------------
-
-        # ① 営業費用売上比率 (売上 / (売上 - 営業利益))
+        # --- Phase 1 ---
+        # ① 営業費用売上比率
         revenue = get_value(fins, ['Total Revenue'], latest_date)
         op_income = get_value(fins, ['Operating Income', 'Operating Profit'], latest_date)
+        cost = revenue - op_income
         
         pass_gate1 = False
-        # 0除算対策
-        cost = revenue - op_income
         if revenue > 0 and op_income > 0 and cost > 0:
             ratio = revenue / cost
             res["B_cost_ratio"] = round(ratio, 2)
@@ -243,110 +196,70 @@ def analyze_stock(ticker, current_price_cache):
                 res["C_judge1"] = "合格"
                 pass_gate1 = True
         
-        # ② 配当性向 (YahooJP優先 -> yfinance)
-        payout = yj_data["payout_ratio"] # ここはfloat(30.0)のように入ってくる
-        
-        # 取得値を素の小数(0.3)に変換
+        # ② 配当性向
+        payout = yj_data["payout_ratio"]
         if payout is not None:
             payout = payout / 100.0
-        
         if payout is None:
-            # yfinanceのpayoutRatioは元々小数(0.3など)で返る
             val = info.get("payoutRatio")
-            if val is not None:
-                payout = val
+            if val is not None: payout = val
             
         pass_gate2 = False
         if payout is not None:
-            res["D_payout"] = payout # 素の数値を格納
-            # 判定基準も小数で比較 (20% -> 0.2)
+            res["D_payout"] = payout
             if 0.2 <= payout <= 0.6:
                 res["E_judge2"] = "合格"
                 pass_gate2 = True
-        else:
-            pass
         
-        # ③ 4年連続増収
-        # 過去4期分のデータが必要
+        # ③ 増収
         pass_gate3 = False
         revs = []
         if len(dates) >= 4:
             for i in range(4):
-                val = get_value(fins, ['Total Revenue'], dates[i])
-                revs.append(val)
-            
-            # revs[0]が最新、revs[3]が4年前。全て0より大きいこと
+                revs.append(get_value(fins, ['Total Revenue'], dates[i]))
             if all(r > 0 for r in revs):
-                # t > t-1 > t-2 > t-3
                 if revs[0] > revs[1] > revs[2] > revs[3]:
                     res["G_judge3"] = "合格"
                     pass_gate3 = True
-                
-                # CAGR計算
                 cagr = (revs[0] / revs[3]) ** (1/3) - 1
-                res["F_cagr"] = cagr # 素の数値
-        else:
-            # データ不足
-            pass
+                res["F_cagr"] = cagr
 
-        # ゲート通過判定
         all_gates_passed = pass_gate1 and pass_gate2 and pass_gate3
-
         if not all_gates_passed:
-            return format_result(res) # 計算せず終了
-
-        # ---------------------------
-        # フェーズ2: 11の計算
-        # ---------------------------
-        
-        # 基礎データ
-        # 時価総額 (億円単位に変換)
-        cap = info.get("marketCap")
-        if not cap:
             return format_result(res)
-        cap = cap / 100000000.0 # 億円
+
+        # --- Phase 2 ---
+        cap = info.get("marketCap")
+        if not cap: return format_result(res)
+        cap = cap / 100000000.0
         res["H_cap"] = cap
 
-        # 発行済株式数 (株数はそのまま)
         shares = info.get("sharesOutstanding")
-        if not shares:
-            return format_result(res)
+        if not shares: return format_result(res)
         res["I_shares"] = shares
 
-        # 自己資本 (億円単位に変換)
         equity = get_value(bs, ['Total Stockholder Equity', 'Total Equity', 'Stockholders Equity'], bs.columns[0])
-        if equity == 0:
-            return format_result(res)
-        equity = equity / 100000000.0 # 億円
+        if equity == 0: return format_result(res)
+        equity = equity / 100000000.0
         res["J_equity"] = equity
 
-        # 営業利益 (億円単位に変換)
-        op_income = op_income / 100000000.0 # 億円
+        op_income = op_income / 100000000.0
         res["K_op_income"] = op_income
-        
-        # 決算期
         res["L_date"] = str(latest_date.date())
 
-        # 計算開始
-        # O: NOPAT (単位: 億円)
         nopat = op_income * CONST_NOPAT_RATE
         res["O_nopat"] = nopat
         
-        # P: 擬似配当 (単位: 億円)
         pseudo_div = nopat * CONST_PAYOUT_RATE
         res["P_pseudo_div"] = pseudo_div
 
-        # Q: 擬似ROE (単位: 素の小数)
         if equity > 0:
             pseudo_roe = nopat / equity
-            res["Q_pseudo_roe"] = pseudo_roe 
+            res["Q_pseudo_roe"] = pseudo_roe
             
-            # R: ROE区分 & S: 7年後倍率
-            roe_val = pseudo_roe # 0.2など
+            roe_val = pseudo_roe
             mult = 1.5
             roe_cls = "10%未満"
-            
-            # 判定基準も小数に変更
             if roe_val >= 0.20:
                 mult = 4.0
                 roe_cls = "20%以上"
@@ -360,101 +273,72 @@ def analyze_stock(ticker, current_price_cache):
             res["R_roe_class"] = roe_cls
             res["S_7y_mult"] = mult
             
-            # T: 7年後配当 (単位: 億円)
             fut_div = pseudo_div * mult
             res["T_7y_div"] = fut_div
             
-            # U: 将来利回り (単位: 素の小数)
             if cap > 0:
                 fut_yield = fut_div / cap
                 res["U_fut_yield"] = fut_yield
-                
-                # W: 上値目途
                 upside = fut_yield / CONST_MARKET_YIELD
                 res["W_upside"] = round(upside, 2)
                 
-                # Y: 目標株価
                 if current_price:
                     target = current_price * upside
                     res["Y_target"] = round(target, 0)
-
-                    # ---------------------------
-                    # フェーズ3: 最終判定
-                    # ---------------------------
                     if upside >= 2.0:
                         res["Z_final"] = "合格"
 
-    except Exception as e:
-        print(f"Error analyzing stock: {e}")
-        # エラー時は現状のresを返す（不合格扱い）
+    except Exception:
+        pass # ログ抑制
 
     return format_result(res)
 
 def format_result(r):
-    """辞書をスプレッドシート書き込み用のリスト(B列以降)に変換"""
-    # 要求に基づき列順序を変更
     row = [
-        # 1. 会社名・業種 (①の左へ移動)
         r["AA_name"], r["AB_sector"],
-        # 2. ゲート1
         r["B_cost_ratio"], r["C_judge1"],
-        # 3. ゲート2
         r["D_payout"], r["E_judge2"],
-        # 4. ゲート3
         r["F_cagr"], r["G_judge3"],
-        # 5. 直近終値、目標株価、最終判定 (③判定と時価総額の間に移動)
         r["X_price"], r["Y_target"], r["Z_final"],
-        # 6. 基礎データ
         r["H_cap"], r["I_shares"], r["J_equity"], r["K_op_income"], r["L_date"],
-        # 7. 係数
         r["M_nopat_k"], r["N_div_k"],
-        # 8. 計算結果
         r["O_nopat"], r["P_pseudo_div"], r["Q_pseudo_roe"],
         r["R_roe_class"], r["S_7y_mult"], r["T_7y_div"],
         r["U_fut_yield"], r["V_mkt_yield"],
         r["W_upside"]
-        # 元々ここにあったX,Y,Z,AA,ABは移動済み
     ]
-    
-    # JSONエラー対策: None, Infinity, NaN を空文字に変換
     cleaned_row = []
     for x in row:
         if x is None:
             cleaned_row.append("")
             continue
-        
         if isinstance(x, float):
-            # inf, -inf, nan であれば空文字にする
             if np.isinf(x) or np.isnan(x):
                 cleaned_row.append("")
                 continue
-        
         cleaned_row.append(x)
-
     return cleaned_row
 
 # ==========================================
-# 4. メイン処理
+# 4. メイン処理 (バッチ処理化)
 # ==========================================
 
 def main():
-    # 休日チェック
     open_flg, reason = is_market_open()
     if not open_flg:
-        print(f"Skipping run: {reason}")
+        print(f"Market Closed: {reason}")
         return
 
     config = get_config_from_env()
     sheet = connect_gsheet(config)
 
-    # --- ヘッダー書き込み (1行目: B列〜AB列) ---
-    # 列移動に合わせてヘッダー順序も修正
+    # ヘッダー (変更なし)
     headers = [
-        "会社名", "業種",                              # ①の左へ
+        "会社名", "業種",
         "①営業費用売上比率", "①判定",
         "②配当性向(%)", "②判定",
         "③売上高CAGR(%)", "③判定",
-        "直近終値", "目標株価", "最終判定",            # ③判定と時価総額の間へ
+        "直近終値", "目標株価", "最終判定",
         "時価総額", "発行済株式数", "自己資本", "営業利益", "決算期",
         "NOPAT係数", "擬似配当係数",
         "NOPAT", "擬似配当", "擬似ROE(%)",
@@ -464,72 +348,88 @@ def main():
     ]
     sheet.update(range_name="B1:AB1", values=[headers])
     
-    # --- A列の銘柄コード読み込み & .T付与 ---
-    raw_tickers = sheet.col_values(1)[1:] # 1行目はヘッダと仮定
+    # 銘柄読み込み
+    raw_tickers = sheet.col_values(1)[1:]
     tickers = []
     for t in raw_tickers:
         if t:
             t_str = str(t).strip()
-            # .T を自動付与
-            if not t_str.endswith(".T"):
-                t_str += ".T"
+            if not t_str.endswith(".T"): t_str += ".T"
             tickers.append(t_str)
     
-    print(f"Target Tickers: {len(tickers)}")
+    total_tickers = len(tickers)
+    print(f"Total Tickers: {total_tickers}")
     
-    # 現在株価の一括取得 (高速化)
-    print("Downloading stock prices...")
-    price_cache = {}
-    if tickers:
+    # --- バッチ処理ロジック ---
+    # 2800銘柄を 50件ずつの塊(Batch)にして処理・書き込みを行う
+    BATCH_SIZE = 50
+    
+    # 全体の処理インデックス
+    current_index = 0
+
+    while current_index < total_tickers:
+        # 今回処理するバッチの範囲
+        end_index = min(current_index + BATCH_SIZE, total_tickers)
+        batch_tickers = tickers[current_index:end_index]
+        
+        print(f"Processing batch: {current_index + 1} - {end_index} / {total_tickers}")
+
+        # 1. バッチ分の株価一括取得
+        price_cache = {}
         try:
-            # yfinanceで一括DL
-            df_p = yf.download(tickers, period="1d", group_by='ticker', threads=True, progress=False)
-            for t in tickers:
+            # yfinanceのdownloadログを抑制しつつ取得
+            df_p = yf.download(batch_tickers, period="1d", group_by='ticker', threads=True, progress=False)
+            for t in batch_tickers:
                 try:
-                    if len(tickers) > 1:
+                    if len(batch_tickers) > 1:
                         price = df_p[t]['Close'].iloc[-1]
                     else:
                         price = df_p['Close'].iloc[-1]
                     price_cache[t] = float(price)
                 except:
                     price_cache[t] = None
+        except Exception:
+            pass # ログ抑制
+
+        # 2. バッチ分の分析 (並列処理)
+        # サーバー負荷を考慮し workers は少なめに維持
+        batch_results = {}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(analyze_stock, t, price_cache): t for t in batch_tickers}
+            
+            for future in futures:
+                t = futures[future]
+                try:
+                    res_list = future.result()
+                    batch_results[t] = res_list
+                except Exception:
+                    batch_results[t] = [""] * 27
+
+        # 3. バッチ分の結果を整形
+        output_rows = []
+        for t in batch_tickers:
+            output_rows.append(batch_results.get(t, [""] * 27))
+
+        # 4. スプレッドシートへ追記書き込み
+        # 書き込み開始行: ヘッダ(1行) + 既に処理した行数 + 1(1-based index) => current_index + 2
+        start_row = current_index + 2
+        end_row = start_row + len(output_rows) - 1
+        range_name = f"B{start_row}:AB{end_row}"
+        
+        try:
+            sheet.update(range_name=range_name, values=output_rows)
+            # API制限回避のための待機
+            time.sleep(2) 
         except Exception as e:
-            print(f"Bulk download failed: {e}")
+            print(f"Sheet Update Error at batch {current_index}: {e}")
 
-    # 分析実行 (並列処理)
-    print("Analyzing stocks...")
-    results_map = {}
-    
-    # サーバー負荷とスクレイピング制限を考慮し、同時実行数は控えめに(3-5)
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(analyze_stock, t, price_cache): t for t in tickers}
+        # 次のバッチへ
+        current_index += BATCH_SIZE
         
-        # ログに銘柄コードを出さないよう、カウンターで進捗を表示
-        total = len(tickers)
-        count = 0
-        for future in futures:
-            t = futures[future]
-            count += 1
-            try:
-                res_list = future.result()
-                results_map[t] = res_list
-                # 銘柄コード(t)を表示せず、件数のみ表示
-                print(f"Progress: {count}/{total}")
-            except Exception as e:
-                print(f"Failed: {count}/{total} (Error occurred)")
-                results_map[t] = [""] * 27 # エラー時は空行
+        # バッチ間にも少し待機を入れてサーバーを休ませる
+        time.sleep(3)
 
-    # 結果をリストに整形 (元のA列の順番を守る)
-    output_rows = []
-    for t in tickers:
-        output_rows.append(results_map.get(t, [""] * 27))
-        
-    # スプレッドシートへ一括書き込み
-    # B2 (row=2, col=2) から書き込み開始
-    if output_rows:
-        range_name = f"B2:AB{2 + len(output_rows) - 1}"
-        sheet.update(range_name=range_name, values=output_rows)
-        print("Spreadsheet updated successfully.")
+    print("All processing completed.")
 
 if __name__ == "__main__":
     main()
