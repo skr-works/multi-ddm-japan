@@ -1,0 +1,31 @@
+name: Yamamoto Model Screener
+
+on:
+  schedule:
+    # UTC 06:33 -> JST 15:33 (月～金)
+    - cron: '33 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Screener
+        env:
+          # Secretを環境変数として渡す
+          GCP_KEYS: ${{ secrets.GCP_KEYS }}
+        run: |
+          python main.py
