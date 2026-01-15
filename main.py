@@ -109,7 +109,8 @@ def get_yahoo_jp_info(ticker_code):
                         if text and text != "-" and text != "---":
                             data["payout_ratio"] = float(text)
         except Exception as e:
-            print(f"Yahoo JP Dividend Error {ticker_code}: {e}")
+            # ログ漏洩防止のため銘柄コードは出さない
+            print(f"Yahoo JP Dividend Error: {e}")
         
         # --- 2. 銘柄名・業種の取得 ---
         try:
@@ -141,10 +142,10 @@ def get_yahoo_jp_info(ticker_code):
                         data["sector"] = sec
                         break
         except Exception as e:
-            print(f"Yahoo JP Profile Error {ticker_code}: {e}")
+            print(f"Yahoo JP Profile Error: {e}")
 
     except Exception as e:
-        print(f"Yahoo JP Scraping Critical Error {ticker_code}: {e}")
+        print(f"Yahoo JP Scraping Critical Error: {e}")
     
     return data
 
@@ -243,21 +244,26 @@ def analyze_stock(ticker, current_price_cache):
                 pass_gate1 = True
         
         # ② 配当性向 (YahooJP優先 -> yfinance)
-        payout = yj_data["payout_ratio"]
+        payout = yj_data["payout_ratio"] # ここはfloat(30.0)のように入ってくる
+        
+        # 取得値を素の小数(0.3)に変換
+        if payout is not None:
+            payout = payout / 100.0
+        
         if payout is None:
-            # yfinanceのpayoutRatioは小数(0.3など)で返る
+            # yfinanceのpayoutRatioは元々小数(0.3など)で返る
             val = info.get("payoutRatio")
             if val is not None:
-                payout = val * 100
+                payout = val
             
         pass_gate2 = False
         if payout is not None:
-            res["D_payout"] = round(payout, 2)
-            if 20 <= payout <= 60:
+            res["D_payout"] = payout # 素の数値を格納
+            # 判定基準も小数で比較 (20% -> 0.2)
+            if 0.2 <= payout <= 0.6:
                 res["E_judge2"] = "合格"
                 pass_gate2 = True
         else:
-            # 取得できない場合は判定不能（不合格）
             pass
         
         # ③ 4年連続増収
@@ -278,7 +284,7 @@ def analyze_stock(ticker, current_price_cache):
                 
                 # CAGR計算
                 cagr = (revs[0] / revs[3]) ** (1/3) - 1
-                res["F_cagr"] = round(cagr * 100, 2)
+                res["F_cagr"] = cagr # 素の数値
         else:
             # データ不足
             pass
@@ -294,70 +300,74 @@ def analyze_stock(ticker, current_price_cache):
         # ---------------------------
         
         # 基礎データ
-        # 時価総額
+        # 時価総額 (億円単位に変換)
         cap = info.get("marketCap")
         if not cap:
             return format_result(res)
+        cap = cap / 100000000.0 # 億円
         res["H_cap"] = cap
 
-        # 発行済株式数
+        # 発行済株式数 (株数はそのまま)
         shares = info.get("sharesOutstanding")
         if not shares:
             return format_result(res)
         res["I_shares"] = shares
 
-        # 自己資本 (複数のキーを試す)
+        # 自己資本 (億円単位に変換)
         equity = get_value(bs, ['Total Stockholder Equity', 'Total Equity', 'Stockholders Equity'], bs.columns[0])
         if equity == 0:
             return format_result(res)
+        equity = equity / 100000000.0 # 億円
         res["J_equity"] = equity
 
-        # 営業利益 (取得済み)
+        # 営業利益 (億円単位に変換)
+        op_income = op_income / 100000000.0 # 億円
         res["K_op_income"] = op_income
         
         # 決算期
         res["L_date"] = str(latest_date.date())
 
         # 計算開始
-        # O: NOPAT
+        # O: NOPAT (単位: 億円)
         nopat = op_income * CONST_NOPAT_RATE
         res["O_nopat"] = nopat
         
-        # P: 擬似配当
+        # P: 擬似配当 (単位: 億円)
         pseudo_div = nopat * CONST_PAYOUT_RATE
         res["P_pseudo_div"] = pseudo_div
 
-        # Q: 擬似ROE
+        # Q: 擬似ROE (単位: 素の小数)
         if equity > 0:
             pseudo_roe = nopat / equity
-            res["Q_pseudo_roe"] = round(pseudo_roe * 100, 2)
+            res["Q_pseudo_roe"] = pseudo_roe 
             
             # R: ROE区分 & S: 7年後倍率
-            roe_val = pseudo_roe * 100
+            roe_val = pseudo_roe # 0.2など
             mult = 1.5
             roe_cls = "10%未満"
             
-            if roe_val >= 20:
+            # 判定基準も小数に変更
+            if roe_val >= 0.20:
                 mult = 4.0
                 roe_cls = "20%以上"
-            elif roe_val >= 15:
+            elif roe_val >= 0.15:
                 mult = 3.0
                 roe_cls = "15-20%"
-            elif roe_val >= 10:
+            elif roe_val >= 0.10:
                 mult = 2.0
                 roe_cls = "10-15%"
             
             res["R_roe_class"] = roe_cls
             res["S_7y_mult"] = mult
             
-            # T: 7年後配当
+            # T: 7年後配当 (単位: 億円)
             fut_div = pseudo_div * mult
             res["T_7y_div"] = fut_div
             
-            # U: 将来利回り
+            # U: 将来利回り (単位: 素の小数)
             if cap > 0:
                 fut_yield = fut_div / cap
-                res["U_fut_yield"] = round(fut_yield * 100, 2)
+                res["U_fut_yield"] = fut_yield
                 
                 # W: 上値目途
                 upside = fut_yield / CONST_MARKET_YIELD
@@ -375,27 +385,35 @@ def analyze_stock(ticker, current_price_cache):
                         res["Z_final"] = "合格"
 
     except Exception as e:
-        print(f"Error analyzing {ticker}: {e}")
+        print(f"Error analyzing stock: {e}")
         # エラー時は現状のresを返す（不合格扱い）
 
     return format_result(res)
 
 def format_result(r):
     """辞書をスプレッドシート書き込み用のリスト(B列以降)に変換"""
-    # 列順序: B -> Z, AA, AB
+    # 要求に基づき列順序を変更
     row = [
+        # 1. 会社名・業種 (①の左へ移動)
+        r["AA_name"], r["AB_sector"],
+        # 2. ゲート1
         r["B_cost_ratio"], r["C_judge1"],
+        # 3. ゲート2
         r["D_payout"], r["E_judge2"],
+        # 4. ゲート3
         r["F_cagr"], r["G_judge3"],
+        # 5. 直近終値、目標株価、最終判定 (③判定と時価総額の間に移動)
+        r["X_price"], r["Y_target"], r["Z_final"],
+        # 6. 基礎データ
         r["H_cap"], r["I_shares"], r["J_equity"], r["K_op_income"], r["L_date"],
+        # 7. 係数
         r["M_nopat_k"], r["N_div_k"],
+        # 8. 計算結果
         r["O_nopat"], r["P_pseudo_div"], r["Q_pseudo_roe"],
         r["R_roe_class"], r["S_7y_mult"], r["T_7y_div"],
         r["U_fut_yield"], r["V_mkt_yield"],
-        r["W_upside"], r["X_price"], r["Y_target"],
-        r["Z_final"],
-        # 参照
-        r["AA_name"], r["AB_sector"]
+        r["W_upside"]
+        # 元々ここにあったX,Y,Z,AA,ABは移動済み
     ]
     
     # JSONエラー対策: None, Infinity, NaN を空文字に変換
@@ -430,18 +448,19 @@ def main():
     sheet = connect_gsheet(config)
 
     # --- ヘッダー書き込み (1行目: B列〜AB列) ---
+    # 列移動に合わせてヘッダー順序も修正
     headers = [
+        "会社名", "業種",                              # ①の左へ
         "①営業費用売上比率", "①判定",
         "②配当性向(%)", "②判定",
         "③売上高CAGR(%)", "③判定",
+        "直近終値", "目標株価", "最終判定",            # ③判定と時価総額の間へ
         "時価総額", "発行済株式数", "自己資本", "営業利益", "決算期",
         "NOPAT係数", "擬似配当係数",
         "NOPAT", "擬似配当", "擬似ROE(%)",
         "ROE区分", "7年後配当倍率", "7年後配当",
         "将来利回り(%)", "市場平均配当利回り",
-        "上値目途(倍率)", "直近終値", "目標株価",
-        "最終判定",
-        "会社名", "業種"
+        "上値目途(倍率)"
     ]
     sheet.update(range_name="B1:AB1", values=[headers])
     
@@ -485,14 +504,19 @@ def main():
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(analyze_stock, t, price_cache): t for t in tickers}
         
+        # ログに銘柄コードを出さないよう、カウンターで進捗を表示
+        total = len(tickers)
+        count = 0
         for future in futures:
             t = futures[future]
+            count += 1
             try:
                 res_list = future.result()
                 results_map[t] = res_list
-                print(f"Done: {t}")
+                # 銘柄コード(t)を表示せず、件数のみ表示
+                print(f"Progress: {count}/{total}")
             except Exception as e:
-                print(f"Failed: {t} {e}")
+                print(f"Failed: {count}/{total} (Error occurred)")
                 results_map[t] = [""] * 27 # エラー時は空行
 
     # 結果をリストに整形 (元のA列の順番を守る)
