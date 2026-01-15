@@ -45,7 +45,7 @@ def connect_gsheet(config):
     return worksheet
 
 # ==========================================
-# 2. スクレイピング & 通信ヘルパー (buhin.pyベース)
+# 2. スクレイピング & 通信ヘルパー (buhin.py統合版)
 # ==========================================
 
 def create_session():
@@ -64,7 +64,6 @@ _HTTP_SESSION = create_session()
 
 def is_market_open():
     """休日判定 (簡易版: 土日のみチェック)"""
-    # 厳密な祝日判定が必要な場合は jpholiday を導入してください
     d = datetime.date.today()
     if d.weekday() >= 5:
         return False, "土日"
@@ -81,10 +80,10 @@ def get_yahoo_jp_info(ticker_code):
     
     # 配当ページ
     url_div = f"https://finance.yahoo.co.jp/quote/{code_only}.T/dividend"
-    # プロフィールページ(業種用)
+    # プロフィールページ(業種・社名用)
     url_prof = f"https://finance.yahoo.co.jp/quote/{code_only}.T/profile"
     
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     data = {
         "payout_ratio": None,
         "name": str(ticker_code),
@@ -92,40 +91,60 @@ def get_yahoo_jp_info(ticker_code):
     }
 
     try:
-        time.sleep(random.uniform(1.0, 2.0)) # マナー待機
+        # スクレイピング検知回避のためのランダム待機
+        time.sleep(random.uniform(1.0, 2.0))
 
-        # 1. 配当性向の取得
-        res = _HTTP_SESSION.get(url_div, headers=headers, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            # "配当性向" という文字列を含むthを探し、その隣のtdを取得
-            th = soup.find("th", string=re.compile("配当性向"))
-            if th:
-                td = th.find_next_sibling("td")
-                if td:
-                    text = td.get_text(strip=True).replace("%", "")
-                    try:
-                        data["payout_ratio"] = float(text)
-                    except:
-                        pass
+        # --- 1. 配当性向の取得 ---
+        try:
+            res = _HTTP_SESSION.get(url_div, headers=headers, timeout=10)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, "html.parser")
+                # "配当性向" という文字列を含むthを探し、その隣のtdを取得
+                th = soup.find("th", string=re.compile("配当性向"))
+                if th:
+                    td = th.find_next_sibling("td")
+                    if td:
+                        text = td.get_text(strip=True).replace("%", "")
+                        # ハイフン等は除外
+                        if text and text != "-" and text != "---":
+                            data["payout_ratio"] = float(text)
+        except Exception as e:
+            print(f"Yahoo JP Dividend Error {ticker_code}: {e}")
         
-        # 2. 銘柄名・業種の取得
-        res_prof = _HTTP_SESSION.get(url_prof, headers=headers, timeout=10)
-        if res_prof.status_code == 200:
-            soup = BeautifulSoup(res_prof.text, "html.parser")
-            title_tag = soup.find("title")
-            if title_tag:
-                # <title>トヨタ自動車(株)【7203】...
-                m = re.search(r'(.*?)【', title_tag.text)
-                if m:
-                    data["name"] = m.group(1).strip()
-            
-            # 業種 (Yahooの構造に依存、取れなければスキップ)
-            # 汎用的にクラス名が変わるため、yfinanceのsectorで補完も検討
-            pass 
+        # --- 2. 銘柄名・業種の取得 ---
+        try:
+            res_prof = _HTTP_SESSION.get(url_prof, headers=headers, timeout=10)
+            if res_prof.status_code == 200:
+                soup = BeautifulSoup(res_prof.text, "html.parser")
+                
+                # 社名
+                title_tag = soup.find("title")
+                if title_tag:
+                    # <title>トヨタ自動車(株)【7203】...
+                    m = re.search(r'(.*?)【', title_tag.text)
+                    if m:
+                        data["name"] = m.group(1).strip()
+                
+                # 業種 (YahooファイナンスのHTML構造から推測)
+                # 東証33業種リストにある単語が含まれているかチェック
+                TSE_SECTORS = [
+                    "水産・農林業", "鉱業", "建設業", "食料品", "繊維製品", "パルプ・紙", "化学",
+                    "医薬品", "石油・石炭製品", "ゴム製品", "ガラス・土石製品", "鉄鋼", "非鉄金属",
+                    "金属製品", "機械", "電気機器", "輸送用機器", "精密機器", "その他製品",
+                    "電気・ガス業", "陸運業", "海運業", "空運業", "倉庫・運輸関連業", "情報・通信業",
+                    "卸売業", "小売業", "銀行業", "証券、商品先物取引業", "保険業",
+                    "その他金融業", "不動産業", "サービス業"
+                ]
+                text_content = soup.get_text()
+                for sec in TSE_SECTORS:
+                    if sec in text_content:
+                        data["sector"] = sec
+                        break
+        except Exception as e:
+            print(f"Yahoo JP Profile Error {ticker_code}: {e}")
 
     except Exception as e:
-        print(f"Yahoo JP Scraping Error {ticker_code}: {e}")
+        print(f"Yahoo JP Scraping Critical Error {ticker_code}: {e}")
     
     return data
 
@@ -133,19 +152,25 @@ def get_yahoo_jp_info(ticker_code):
 # 3. コアロジック: 山本潤式モデル
 # ==========================================
 
-def get_financial_value(df, keys, col_idx=0):
-    """財務DFから値を取得。欠損はNoneを返す"""
-    if df.empty: return None
-    try:
-        date_col = df.columns[col_idx]
-        for key in keys:
-            if key in df.index:
-                val = df.loc[key, date_col]
-                if pd.isna(val): return None
-                return float(val)
-    except:
-        return None
-    return None
+def get_value(df, keys, date_col):
+    """
+    buhin.py から移植・改良
+    財務データDataFrameから特定の日付・キーの値を取得する
+    """
+    if df.empty or date_col is None:
+        return 0
+    
+    # date_colがDataFrameに存在するかチェック
+    if date_col not in df.columns:
+        return 0
+
+    for key in keys:
+        if key in df.index:
+            val = df.loc[key, date_col]
+            if pd.isna(val):
+                continue
+            return float(val)
+    return 0
 
 def analyze_stock(ticker, current_price_cache):
     """
@@ -173,36 +198,45 @@ def analyze_stock(ticker, current_price_cache):
         # 1. Yahoo Japan (配当性向優先)
         yj_data = get_yahoo_jp_info(ticker)
         res["AA_name"] = yj_data["name"]
+        res["AB_sector"] = yj_data["sector"]
         
         # 2. yfinance
         tk = yf.Ticker(ticker)
-        # info取得 (時価総額など)
         info = tk.info or {}
         
         # 財務データ (Annual)
         fins = tk.financials
         bs = tk.balance_sheet
         
+        # データが空の場合は終了
         if fins.empty or bs.empty:
             return format_result(res)
 
-        # 現在株価 (一括取得キャッシュ or info)
+        # 現在株価 (キャッシュ または info)
         current_price = current_price_cache.get(ticker)
         if not current_price:
             current_price = info.get("currentPrice") or info.get("previousClose")
         res["X_price"] = current_price
+
+        # 最新の決算日を取得 (列名が日付になっている)
+        dates = fins.columns
+        if len(dates) == 0:
+            return format_result(res)
+        latest_date = dates[0] # 最新
 
         # ---------------------------
         # フェーズ1: 3つのゲート
         # ---------------------------
 
         # ① 営業費用売上比率 (売上 / (売上 - 営業利益))
-        revenue = get_financial_value(fins, ['Total Revenue'], 0)
-        op_income = get_financial_value(fins, ['Operating Income', 'Operating Profit'], 0)
+        revenue = get_value(fins, ['Total Revenue'], latest_date)
+        op_income = get_value(fins, ['Operating Income', 'Operating Profit'], latest_date)
         
         pass_gate1 = False
-        if revenue and op_income and (revenue - op_income) > 0:
-            ratio = revenue / (revenue - op_income)
+        # 0除算対策
+        cost = revenue - op_income
+        if revenue > 0 and op_income > 0 and cost > 0:
+            ratio = revenue / cost
             res["B_cost_ratio"] = round(ratio, 2)
             if ratio >= 1.15:
                 res["C_judge1"] = "合格"
@@ -211,8 +245,10 @@ def analyze_stock(ticker, current_price_cache):
         # ② 配当性向 (YahooJP優先 -> yfinance)
         payout = yj_data["payout_ratio"]
         if payout is None:
-            payout = info.get("payoutRatio")
-            if payout: payout = payout * 100 # yfは小数なので%になおす
+            # yfinanceのpayoutRatioは小数(0.3など)で返る
+            val = info.get("payoutRatio")
+            if val is not None:
+                payout = val * 100
             
         pass_gate2 = False
         if payout is not None:
@@ -220,25 +256,32 @@ def analyze_stock(ticker, current_price_cache):
             if 20 <= payout <= 60:
                 res["E_judge2"] = "合格"
                 pass_gate2 = True
+        else:
+            # 取得できない場合は判定不能（不合格）
+            pass
         
         # ③ 4年連続増収
+        # 過去4期分のデータが必要
         pass_gate3 = False
         revs = []
-        for i in range(4):
-            val = get_financial_value(fins, ['Total Revenue'], i)
-            revs.append(val)
-        
-        # revs[0]が最新、revs[3]が4年前。全て存在チェック
-        if all(r is not None for r in revs):
-            # t > t-1 > t-2 > t-3
-            if revs[0] > revs[1] > revs[2] > revs[3]:
-                res["G_judge3"] = "合格"
-                pass_gate3 = True
+        if len(dates) >= 4:
+            for i in range(4):
+                val = get_value(fins, ['Total Revenue'], dates[i])
+                revs.append(val)
             
-            # CAGR計算
-            if revs[3] > 0:
+            # revs[0]が最新、revs[3]が4年前。全て0より大きいこと
+            if all(r > 0 for r in revs):
+                # t > t-1 > t-2 > t-3
+                if revs[0] > revs[1] > revs[2] > revs[3]:
+                    res["G_judge3"] = "合格"
+                    pass_gate3 = True
+                
+                # CAGR計算
                 cagr = (revs[0] / revs[3]) ** (1/3) - 1
                 res["F_cagr"] = round(cagr * 100, 2)
+        else:
+            # データ不足
+            pass
 
         # ゲート通過判定
         all_gates_passed = pass_gate1 and pass_gate2 and pass_gate3
@@ -253,7 +296,7 @@ def analyze_stock(ticker, current_price_cache):
         # 基礎データ
         # 時価総額
         cap = info.get("marketCap")
-        if not cap: # 計算不能
+        if not cap:
             return format_result(res)
         res["H_cap"] = cap
 
@@ -263,9 +306,9 @@ def analyze_stock(ticker, current_price_cache):
             return format_result(res)
         res["I_shares"] = shares
 
-        # 自己資本
-        equity = get_financial_value(bs, ['Total Stockholder Equity', 'Total Equity'], 0)
-        if not equity:
+        # 自己資本 (複数のキーを試す)
+        equity = get_value(bs, ['Total Stockholder Equity', 'Total Equity', 'Stockholders Equity'], bs.columns[0])
+        if equity == 0:
             return format_result(res)
         res["J_equity"] = equity
 
@@ -273,8 +316,7 @@ def analyze_stock(ticker, current_price_cache):
         res["K_op_income"] = op_income
         
         # 決算期
-        if not fins.columns.empty:
-            res["L_date"] = str(fins.columns[0].date())
+        res["L_date"] = str(latest_date.date())
 
         # 計算開始
         # O: NOPAT
