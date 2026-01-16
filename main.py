@@ -192,7 +192,14 @@ def analyze_stock(ticker, current_price_cache):
         if revenue > 0 and op_income > 0 and cost > 0:
             ratio = revenue / cost
             res["B_cost_ratio"] = round(ratio, 2)
-            if ratio >= 1.15:
+            
+            # --- 例外規定の適用 ---
+            # 基本は 1.15 だが、小売・サービス・卸売は 1.05 に緩和
+            threshold = 1.15
+            if yj_data["sector"] in ["小売業", "サービス業", "卸売業"]:
+                threshold = 1.05
+            
+            if ratio >= threshold:
                 res["C_judge1"] = "合格"
                 pass_gate1 = True
         
