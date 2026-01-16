@@ -24,6 +24,20 @@ CONST_NOPAT_RATE = 0.6       # M: NOPAT係数
 CONST_PAYOUT_RATE = 0.4      # N: 擬似配当係数
 CONST_MARKET_YIELD = 0.021   # V: 市場平均配当利回り (2.1%)
 
+# 修正: User-Agentリスト (ランダム化用)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0"
+]
+
 def get_config_from_env():
     """環境変数から設定JSONを読み込む"""
     keys_json = os.environ.get("GCP_KEYS")
@@ -75,12 +89,13 @@ def get_yahoo_jp_info(ticker_code):
     url_div = f"https://finance.yahoo.co.jp/quote/{code_only}.T/dividend"
     url_prof = f"https://finance.yahoo.co.jp/quote/{code_only}.T/profile"
     
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    # 修正: User-Agentをランダムに選択
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
     data = {"payout_ratio": None, "name": str(ticker_code), "sector": "-"}
 
     try:
-        # ランダム待機 (サーバー負荷軽減)
-        time.sleep(random.uniform(1.5, 3.0))
+        # 修正: 待機時間を短縮 (0.05〜0.9秒)
+        time.sleep(random.uniform(0.05, 0.9))
 
         # 1. 配当性向
         try:
@@ -165,17 +180,32 @@ def analyze_stock(ticker, current_price_cache):
         
         # yfinance
         tk = yf.Ticker(ticker)
-        info = tk.info or {}
+        
+        # 修正: stock.infoの全廃とfast_infoへの移行
+        # info = tk.info or {} # 削除: 全情報取得は重いため廃止
+        
+        # 修正: 404エラーの即時撤退 (Fail Fast)
+        # fast_infoやfinancialsへのアクセスでエラーが出る場合に備えてチェック
+        try:
+             _ = tk.fast_info.last_price # 試しにアクセスして存在確認
+        except Exception as e:
+             if "404" in str(e) or "Not Found" in str(e):
+                 return format_result(res) # 即時終了
+
         fins = tk.financials
         bs = tk.balance_sheet
         
         if fins.empty or bs.empty:
             return format_result(res)
 
-        # 現在株価
+        # 現在株価 (優先: キャッシュ -> fast_info)
         current_price = current_price_cache.get(ticker)
         if not current_price:
-            current_price = info.get("currentPrice") or info.get("previousClose")
+            # 修正: fast_infoを使用
+            try:
+                current_price = tk.fast_info.last_price
+            except:
+                pass
         res["X_price"] = current_price
 
         dates = fins.columns
@@ -204,12 +234,18 @@ def analyze_stock(ticker, current_price_cache):
                 pass_gate1 = True
         
         # ② 配当性向
+        # 修正: スクレイピング優先 -> 失敗時のみinfo取得
         payout = yj_data["payout_ratio"]
         if payout is not None:
-            payout = payout / 100.0
+            payout = payout / 100.0 # パーセントを小数に
+        
         if payout is None:
-            val = info.get("payoutRatio")
-            if val is not None: payout = val
+            # フォールバック: ここでのみ stock.info にアクセス (コスト大だが必須項目のため)
+            try:
+                val = tk.info.get("payoutRatio")
+                if val is not None: payout = val
+            except:
+                pass
             
         pass_gate2 = False
         if payout is not None:
@@ -236,12 +272,24 @@ def analyze_stock(ticker, current_price_cache):
             return format_result(res)
 
         # --- Phase 2 ---
-        cap = info.get("marketCap")
+        # 修正: fast_infoを使用 (market_cap)
+        cap = None
+        try:
+            cap = tk.fast_info.market_cap
+        except:
+            pass
+            
         if not cap: return format_result(res)
         cap = cap / 100000000.0
         res["H_cap"] = cap
 
-        shares = info.get("sharesOutstanding")
+        # 修正: fast_infoを使用 (shares)
+        shares = None
+        try:
+            shares = tk.fast_info.shares
+        except:
+            pass
+            
         if not shares: return format_result(res)
         res["I_shares"] = shares
 
