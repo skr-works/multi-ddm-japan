@@ -1,3 +1,5 @@
+multi-ddmの7年版  
+
 https://www.nikkei.com/markets/kabu/japanidx/  
 をみて、main.pyの固定値「市場平均配当利回り」を修正する必要がある。
 
