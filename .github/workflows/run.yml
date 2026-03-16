@@ -9,10 +9,14 @@ on:
 jobs:
   run-analysis:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -29,3 +33,19 @@ jobs:
           GCP_KEYS: ${{ secrets.GCP_KEYS }}
         run: |
           python main.py
+
+      - name: Keep workflow alive
+        run: |
+          LAST_COMMIT_DATE=$(git log -1 --format=%ct)
+          CURRENT_DATE=$(date +%s)
+          DIFF_DAYS=$(( (CURRENT_DATE - LAST_COMMIT_DATE) / 86400 ))
+          
+          if [ "$DIFF_DAYS" -ge 50 ]; then
+            echo "最終コミットから ${DIFF_DAYS} 日経過しているため、空コミットを作成します。"
+            git config --local user.name "github-actions[bot]"
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep workflow alive [skip ci]"
+            git push
+          else
+            echo "最終コミットから ${DIFF_DAYS} 日経過しています。空コミットは不要です。"
+          fi
